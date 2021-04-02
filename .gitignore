@@ -1,0 +1,19 @@
+# data folder
+data/
+
+# caches
+__pycache__/
+.idea/
+.vscode/
+
+# enviroments
+venv/
+
+# nohup file
+nohup.out
+
+# logs file
+log
+
+# work dir
+work_result/
