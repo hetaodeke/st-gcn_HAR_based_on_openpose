@@ -3,9 +3,12 @@ import os
 import random
 import shutil
 import time
+from train_simpleddp import args
 import warnings
+import logging
 
 import torch
+from torch.multiprocessing.spawn import spawn
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -14,35 +17,31 @@ import torch.optim
 import torch.multiprocessing as mp
 import torch.utils.data
 import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+from torch.nn.parallel import DistributedDataParallel as DDP
+from tensorboardX import SummaryWriter
 
 
-from apex import amp
-from apex.parallel import DistributedDataParallel
-
+# from apex import amp
+# from apex.parallel import DistributedDataParallel
 from feeder.feeders import Feeder
 from net.st_gcn import Model
 
-model_names = sorted(name for name in Model.__dict__
-                     if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('--data', default='data/ucf101_skeleton/ImageNet2012', help='path to train dataset')
-parser.add_argument('--label', default='/home/zhangzhi/Data/exports/ImageNet2012', help='path to train label')
-parser.add_argument('--val_data', default='/home/zhangzhi/Data/exports/ImageNet2012', help='path to val dataset')
-parser.add_argument('--val_label', default='/home/zhangzhi/Data/exports/ImageNet2012', help='path to val label')
-parser.add_argument('-j',
-                    '--workers',
-                    default=4,
+parser.add_argument('--data', default='data/ucf101_skeleton/train_data.npy', help='path to train dataset')
+parser.add_argument('--label', default='data/ucf101_skeleton/train_label.pkl', help='path to train label')
+parser.add_argument('--val_data', default='data/ucf101_skeleton/val_data.npy', help='path to val dataset')
+parser.add_argument('--val_label', default='data/ucf101_skeleton/val_label.pkl', help='path to val label')
+parser.add_argument('--nprocs',
+                    default=2,
                     type=int,
                     metavar='N',
-                    help='number of data loading workers (default: 4)')
+                    help='number of data loading workers')
 parser.add_argument('--epochs', default=90, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('-b',
                     '--batch-size',
-                    default=3200,
+                    default=32,
                     type=int,
                     metavar='N',
                     help='mini-batch size (default: 6400), this is the total '
@@ -68,6 +67,7 @@ parser.add_argument('-p', '--print-freq', default=10, type=int, metavar='N', hel
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true', help='use pre-trained model')
 parser.add_argument('--seed', default=None, type=int, help='seed for initializing training. ')
+args = parser.parse_args()
 
 
 def reduce_mean(tensor, nprocs):
@@ -77,9 +77,10 @@ def reduce_mean(tensor, nprocs):
     return rt
 
 
-def main():
-    args = parser.parse_args()
-    args.nprocs = torch.cuda.device_count()
+
+def main_worker(rank, nprocs, args):
+    best_acc1 = .0
+    torch.cuda.set_device(rank)
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -91,13 +92,10 @@ def main():
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-    main_worker(args.local_rank, args.nprocs, args)
+    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=20, format='%(asctime)s - %(message)s')
 
-
-def main_worker(local_rank, nprocs, args):
-    best_acc1 = .0
-
-    dist.init_process_group(backend='nccl')
+    dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:23456', world_size=args.nprocs, rank=rank)
     # create model
     model = Model(
         in_channels = 3,
@@ -105,22 +103,17 @@ def main_worker(local_rank, nprocs, args):
         # graph = 'graph.Graph',
         graph_args = {"layout":'openpose', "strategy":'spatial'},
         edge_importance_weighting = True
-)
+    ).cuda(rank)
 
-    torch.cuda.set_device(local_rank)
-    model.cuda()
-    # When using a single GPU per process and per
-    # DistributedDataParallel, we need to divide the batch size
-    # ourselves based on the total number of GPUs we have
     args.batch_size = int(args.batch_size / nprocs)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().cuda(rank)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    model, optimizer = amp.initialize(model, optimizer)
-    model = DistributedDataParallel(model)
+    # model, optimizer = amp.initialize(model, optimizer)
+    model = DDP(model, device_ids=[rank])
 
     cudnn.benchmark = True
 
@@ -144,35 +137,41 @@ def main_worker(local_rank, nprocs, args):
                                              num_workers=2,
                                              pin_memory=True)
 
-    if args.evaluate:
-        validate(val_loader, model, criterion, local_rank, args)
-        return
+    # if args.evaluate:
+    #     validate(val_loader, model, criterion, rank, args)
+    #     return
+
+    # tesorboard writer
+    writer = SummaryWriter()
 
     for epoch in range(args.start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, local_rank, args)
+        loss = train(train_loader, model, criterion, optimizer, epoch, rank, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, local_rank, args)
+        acc1 = validate(val_loader, model, criterion, rank, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        if args.local_rank == 0:
+        if rank == 0:
             save_checkpoint(
                 {
                     'epoch': epoch + 1,
-                    'arch': args.arch,
                     'state_dict': model.module.state_dict(),
                     'best_acc1': best_acc1,
                 }, is_best)
 
+        writer.add_scalar('Loss', loss, epoch)
+        writer.add_scalar('Accuracy', acc1, epoch)
 
-def train(train_loader, model, criterion, optimizer, epoch, local_rank, args):
+    logging.FileHandler('logs/{}_log.txt'.format(time.strftime(r"%Y-%m-%d-%H_%M_%S", time.localtime())))
+
+def train(train_loader, model, criterion, optimizer, epoch, rank, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -188,6 +187,8 @@ def train(train_loader, model, criterion, optimizer, epoch, local_rank, args):
     
     for i, traindata in enumerate(train_loader):
         data, label = traindata
+        data = data.cuda(rank)
+        label = label.cuda(rank)
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -210,8 +211,9 @@ def train(train_loader, model, criterion, optimizer, epoch, local_rank, args):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        with amp.scale_loss(loss, optimizer) as scaled_loss:
-            scaled_loss.backward()
+        # with amp.scale_loss(loss, optimizer) as scaled_loss:
+        #     scaled_loss.backward()
+        loss.backward()
         optimizer.step()
 
         # measure elapsed time
@@ -220,10 +222,11 @@ def train(train_loader, model, criterion, optimizer, epoch, local_rank, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return losses.avg
+    
 
 
-
-def validate(val_loader, model, criterion, local_rank, args):
+def validate(val_loader, model, criterion, rank, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -237,6 +240,9 @@ def validate(val_loader, model, criterion, local_rank, args):
         end = time.time()
         for i, valdata in enumerate(val_loader):
             data, label = valdata
+            data = data.cuda(rank)
+            label = label.cuda(rank)
+
             # compute output
             output = model(data)
             loss = criterion(output, label)
@@ -244,7 +250,7 @@ def validate(val_loader, model, criterion, local_rank, args):
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, label, topk=(1, 5))
 
-            torch.distributed.barrier()
+            # torch.distributed.barrier()
 
             reduced_loss = reduce_mean(loss, args.nprocs)
             reduced_acc1 = reduce_mean(acc1, args.nprocs)
@@ -263,15 +269,15 @@ def validate(val_loader, model, criterion, local_rank, args):
 
 
         # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
+        logging.info(' * Val Acc@1 {top1.avg:.3f} Val Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
 
-    return top1.avg
+    return top1.avg/100
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='checkpoints/checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, 'checkpoints/model_best.pth.tar')
 
 
 class AverageMeter(object):
@@ -307,7 +313,7 @@ class ProgressMeter(object):
     def display(self, batch):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
+        logging.info('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
@@ -334,10 +340,10 @@ def accuracy(output, label, topk=(1, )):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
 
 if __name__ == '__main__':
-    main()
+    mp.spawn(main_worker, nprocs=args.nprocs, args=(args.nprocs, args), join=True)
